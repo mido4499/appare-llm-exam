@@ -1,58 +1,44 @@
 # Measuring wrong YESes in APPARE's LLM profiler
 
-[APPARE](https://github.com/ASTERISC-Release/Appare) expands each syscall's reference function set by asking an LLM whether a profiled caller should be expected to reach an unprofiled callee (`guest/kern-cfg/run-slice-client.py`). The paper's validation (§7.2) samples only caller→callee pairs taken from the profiled traces, so every test pair should get YES. That check can count wrong NOs, but not wrong YESes: unneeded functions the LLM adds to the allow-list. The paper names this risk as a threat to validity (§7.4) but does not measure it.
+This experiment evaluates the LLM inference step of [APPARE](https://github.com/ASTERISC-Release/Appare) ([Zhang et al., IEEE S&P 2026](https://www.chuqiz.com/papers/appare_paper.pdf)). APPARE is included unmodified as a submodule, pinned to `7f5b473`.
 
-This repo measures it. APPARE is included unmodified as a submodule (pinned to `7f5b473`); the scripts here only read its files.
+## Question
 
-## The test
+The paper's validation (§7.2) only tests caller→callee pairs that actually occurred in the profiled traces, so it can't see the LLM adding functions that don't belong. **How often does the LLM wrongly say YES?**
 
-200 questions, each asked with **APPARE's own prompt**, copied verbatim from `run-slice-client.py` lines 138–162. That includes the backward-slice call tree, the source of every function in the slice, and the caller and callee source. The seed is the paper's `nginx-ltp-redis` profile.
+## Setup
 
-| Group | Count | Definition | Correct answer |
-|---|---|---|---|
-| `stranger` | 100 | Edge A→B in `pruned_callgraph_filtered.graphml` (the graph APPARE walks), A in the seed, B one hop out and not in the seed. B never appears in any recording of that syscall by any program, is ftrace-traceable (`fentry-set-raw.txt`), and passes `kfunc_filter.py`. | NO |
-| `hidden_real` | 100 | Edge A→B where both A and B ran in a held-out program (cp, curl, ls, statfs01, tar, unqlite, wget) and B is not in the seed. | YES |
+- **Model:** Qwen3-8B via Ollama (fixed seed, `num_ctx` 32768).
+- **Prompt:** APPARE's own prompt and retrieved context, copied verbatim from `guest/kern-cfg/run-slice-client.py`: backward-slice call tree, slice source code, caller and callee source. Seed = the paper's `nginx-ltp-redis` profiles.
+- **"NO" questions (never ran):** call-graph neighbors. Each is an edge A→B in APPARE's `pruned_callgraph_filtered.graphml`, with A in the seed and B one hop out. B never appears in any recording of that syscall by any program, and it is ftrace-traceable (`fentry-set-raw.txt`), so its absence is meaningful.
+- **"YES" questions (hidden):** edges A→B where both functions ran in a program left out of the seed (cp, curl, ls, statfs01, tar, unqlite, wget), with B not in the seed.
+- **Sampling:** at most 2 questions per caller, drawn from all syscalls (the NO group spans 59 syscalls, the YES group 22). The exam is frozen in `llm-exam/exam_all.json`.
 
-Each group allows at most 2 questions per caller, counted across all syscalls. The exam is frozen in `llm-exam/exam_all.json` (random seed 42); use that file for every comparison.
+## Results
 
-## Results so far
+| Question type | Questions | Model said YES |
+|---|---|---|
+| Never ran (YES is wrong) | 100 | **73%** (±9) |
+| Hidden but ran (YES is right) | 100 | **71%** (±9) |
 
-Qwen3-8B, local, APPARE's prompt unchanged:
+The model says YES at the same rate whether or not the function belongs. Cross-check: on the 67 questions that also appear in APPARE's saved Qwen3-32B logs, 32B said YES to 48% (11/23) of never-ran functions and 68% (30/44) of hidden ones.
 
-| | YES rate |
-|---|---|
-| Strangers (wrong YES) | **73%** (73/100, ±9) |
-| Hidden real (correct YES) | **71%** (71/100, ±9) |
+## Limitations
 
-The model says YES at about the same rate whether or not the function belongs.
+- **Upper bound:** some never-ran functions may be rare but legitimate paths (e.g. error cleanup) that the recordings missed.
+- **Smaller model:** the main results use Qwen3-8B. APPARE uses Qwen3-32B, and the 32B cross-check covers only 67 questions.
+- **Sample size:** 100 questions per group gives about ±9 points of uncertainty, and only one step out from the seed is tested.
 
-Cross-check against Qwen3-32B: 67 of the 200 questions appear verbatim in APPARE's saved logs (`syscall_procs/*/llm_logs_nothink.txt`). On those, 32B said YES to 11/23 strangers (48%) and 30/44 hidden real (68%).
-
-Other observations:
-- The prompt's `\nothink` ending did not disable Qwen3's thinking: all 200 answers included a thinking block.
-- About a third of the naive negatives were not ftrace-traceable (e.g. `_copy_to_user`). Their absence from recordings proves nothing, so they are excluded.
-
-## Caveats
-
-- The wrong-YES rate is an **upper estimate**. Some strangers are rare but benign paths (e.g. error cleanup) that the recordings never hit.
-- The main numbers come from 8B. The 32B comparison covers only 67 questions.
-- Depth-0 questions only, against the original seed graph. The real tool's history grows as it accepts functions.
-- The released prompt has no function summaries or global struct context (described in paper §5.1.2), so neither does this test.
-
-## Reproduce
-
-Needs [Ollama](https://ollama.com/) and about 10 GB of free memory for Qwen3-8B. The submodule is a large repository (it includes two Linux source trees).
+## How to reproduce
 
 ```bash
-git clone --recurse-submodules <this repo>
-cd <repo>
+git clone --recurse-submodules <this repo> && cd <repo>
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-ollama pull qwen3:8b              # and keep `ollama serve` running
+ollama pull qwen3:8b                 # keep `ollama serve` running
 
-python llm-exam/build_exam.py      # optional: rebuilds exam_all.json (same seed, same exam)
-python llm-exam/run_exam.py        # ~65 s/question on a 16 GB M-series Mac; resumable
-python llm-exam/score_exam.py llm-exam/answers_qwen3-8b_baseline.jsonl
+python llm-exam/run_exam.py --tag rerun     # ~65 s per question on a 16 GB Mac; resumable
+python llm-exam/score_exam.py llm-exam/answers_qwen3-8b_rerun.jsonl
 ```
 
-`run_exam.py --tag <name>` writes a separate answers file per variant, so later runs (e.g. new prompt wording, thinking off) can be compared on the same exam.
+To score the original run instead: `python llm-exam/score_exam.py llm-exam/answers_qwen3-8b_baseline.jsonl`. `llm-exam/build_exam.py` regenerates the same exam from APPARE's files.
