@@ -1,0 +1,2 @@
+networkx==3.7
+ollama==0.6.3

@@ -1,0 +1,4 @@
+[submodule "Appare"]
+	path = Appare
+	url = https://github.com/ASTERISC-Release/Appare
+	ignore = dirty
